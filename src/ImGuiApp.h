@@ -28,7 +28,7 @@ private:
     void RenderGPUInfo(const GPUInfo& gpu, int index);
     void RenderCPUInfo(const CPUInfo& cpu);
     void RenderMemoryInfo(const MemoryInfo& memory);
-    void RenderSystemBandwidthInfo(const SystemBandwidthInfo& bandwidth);
+    void RenderSystemBandwidthInfo(const SystemBandwidthInfo& bandwidth, const HardwareMonitor& monitor);
     void RenderDiagnosis(const HardwareMonitor& monitor);
     void DrawProgressBar(const char* label, float value, float min, float max, 
                         const char* suffix = "%", unsigned int  color = 0);

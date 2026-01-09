@@ -438,6 +438,19 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
         ImGui::Spacing();
     }
 
+    // 主机带宽模块 - 使用圆形图表显示（放在GPU详细信息之前）
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.15f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 12.0f));
+    // 使用 0 作为高度，让子窗口根据内容自动调整，没有数据时自动压缩
+    if (ImGui::BeginChild("Bandwidth", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar)) {
+        RenderSystemBandwidthInfo(bandwidth, monitor);
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
     // 详细信息 - 使用表格布局，美观大气
     if (gpuCount > 0 && gpu.available) {
         // GPU详细信息 - 紧凑表格
@@ -653,6 +666,117 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
         ImGui::Spacing();
     }
 
+    // ========== 显示每个内存条的详细信息 ==========
+    const MemoryInfo& memory = monitor.GetMemoryInfo();
+    if (!memory.modules.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.15f, 0.5f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
+        if (ImGui::BeginChild("MemoryModules", ImVec2(0, 0), true)) {
+            ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "💾 内存条详细信息");
+            ImGui::Separator();
+            
+            if (ImGui::BeginTable("MemoryModulesTable", 6, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("内存条", ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableSetupColumn("容量", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("通道", ImGuiTableColumnFlags_WidthFixed, 80);
+                ImGui::TableSetupColumn("最大带宽", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("实时带宽", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("利用率", ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableHeadersRow();
+                
+                for (size_t i = 0; i < memory.modules.size(); i++) {
+                    const MemoryModuleInfo& module = memory.modules[i];
+                    ImGui::TableNextRow();
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%s", module.name.c_str());
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s %d MHz", module.type.c_str(), module.speed);
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.2f GB", module.capacity);
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::Text("通道 %d", module.channel);
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "%.2f GB/s", module.maxBandwidth);
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%.2f GB/s", module.realTimeBandwidth);
+                    
+                    ImGui::TableNextColumn();
+                    ImVec4 moduleColor = GetStatusColor(module.utilization, 0.0f, 80.0f, true);
+                    ImGui::TextColored(moduleColor, "%.1f%%", module.utilization);
+                }
+                
+                ImGui::EndTable();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+    
+    // ========== 显示每个硬盘的详细信息 ==========
+    size_t diskCount = monitor.GetDiskCount();
+    if (diskCount > 0) {
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.15f, 0.5f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
+        if (ImGui::BeginChild("Disks", ImVec2(0, 0), true)) {
+            ImGui::TextColored(ImVec4(0.8f, 0.6f, 0.2f, 1.0f), "💿 硬盘IO详细信息");
+            ImGui::Separator();
+            
+            if (ImGui::BeginTable("DisksTable", 7, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
+                ImGui::TableSetupColumn("硬盘", ImGuiTableColumnFlags_WidthFixed, 80);
+                ImGui::TableSetupColumn("类型", ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableSetupColumn("容量", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("读取带宽", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("写入带宽", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("读取利用率", ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableSetupColumn("写入利用率", ImGuiTableColumnFlags_WidthFixed, 100);
+                ImGui::TableHeadersRow();
+                
+                for (size_t i = 0; i < diskCount; i++) {
+                    const DiskInfo& disk = monitor.GetDiskInfo(i);
+                    ImGui::TableNextRow();
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%s", disk.name.c_str());
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%s", disk.type.c_str());
+                    ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s", disk.model.c_str());
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%.2f GB", disk.totalSize);
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::Text("最大: %.2f GB/s", disk.maxReadBandwidth);
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "实时: %.3f GB/s", disk.realTimeReadBandwidth);
+                    
+                    ImGui::TableNextColumn();
+                    ImGui::Text("最大: %.2f GB/s", disk.maxWriteBandwidth);
+                    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "实时: %.3f GB/s", disk.realTimeWriteBandwidth);
+                    
+                    ImGui::TableNextColumn();
+                    ImVec4 readColor = GetStatusColor(disk.readUtilization, 0.0f, 80.0f, true);
+                    ImGui::TextColored(readColor, "%.1f%%", disk.readUtilization);
+                    
+                    ImGui::TableNextColumn();
+                    ImVec4 writeColor = GetStatusColor(disk.writeUtilization, 0.0f, 80.0f, true);
+                    ImGui::TextColored(writeColor, "%.1f%%", disk.writeUtilization);
+                }
+                
+                ImGui::EndTable();
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
+    }
+
     // CPU和内存详细信息 - 并排显示
     ImGui::Columns(2, "CPUMem", false);
     
@@ -732,17 +856,6 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
     ImGui::PopStyleColor();
     
     ImGui::Columns(1);
-    ImGui::Spacing();
-
-    // 主机带宽模块 - 使用圆形图表显示
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.15f, 0.5f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
-    if (ImGui::BeginChild("Bandwidth", ImVec2(0, 0), true)) {
-        RenderSystemBandwidthInfo(bandwidth);
-    }
-    ImGui::EndChild();
-    ImGui::PopStyleVar();
-    ImGui::PopStyleColor();
     ImGui::Spacing();
 
     // 诊断建议详细信息
@@ -935,31 +1048,78 @@ void ImGuiApp::RenderMemoryInfo(const MemoryInfo& memory) {
     }
 }
 
-void ImGuiApp::RenderSystemBandwidthInfo(const SystemBandwidthInfo& bandwidth) {
+void ImGuiApp::RenderSystemBandwidthInfo(const SystemBandwidthInfo& bandwidth, const HardwareMonitor& monitor) {
     ImGui::TextColored(ImVec4(0.8f, 0.4f, 1.0f, 1.0f), "🌐 主机带宽模块");
     ImGui::Separator();
     
-    ImGui::Text("总系统带宽: ");
+    // 总系统带宽（主板总带宽）
+    ImGui::Text("主板总带宽: ");
     ImGui::SameLine();
     ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%.2f GB/s", bandwidth.totalSystemBandwidth);
+    ImGui::Spacing();
     
-    ImGui::Separator();
-    ImGui::Text("内存带宽:");
-    ImGui::Text("  带宽: %.2f GB/s", bandwidth.memoryBandwidth);
-    ImGui::Text("  类型: %s", bandwidth.memoryType.c_str());
-    ImGui::Text("  速度: %d MHz", bandwidth.memorySpeed);
-    
-    ImGui::Separator();
-    ImGui::Text("PCIe 总带宽: ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "%.2f GB/s", bandwidth.pcieTotalBandwidth);
-    
-    // 总带宽历史图表
-    if (!bandwidth.totalBandwidthHistory.empty()) {
-        float maxBandwidth = *std::max_element(bandwidth.totalBandwidthHistory.begin(), 
-                                               bandwidth.totalBandwidthHistory.end());
-        DrawHistoryChart("总系统带宽历史", bandwidth.totalBandwidthHistory, 0.0f, 
-                        maxBandwidth > 0 ? maxBandwidth * 1.2f : 100.0f, "GB/s");
+    // 使用表格显示详细带宽信息
+    if (ImGui::BeginTable("BandwidthTable", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("带宽类型", ImGuiTableColumnFlags_WidthFixed, 180);
+        ImGui::TableSetupColumn("最大带宽", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("实时带宽", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("利用率", ImGuiTableColumnFlags_WidthFixed, 100);
+        
+        // 1. PCIe 总线带宽（CPU 与 GPU 的桥梁）
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("PCIe 总线带宽");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(CPU ↔ GPU)");
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "%.2f GB/s", bandwidth.pcieMaxBandwidth);
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%.2f GB/s", bandwidth.pcieRealTimeBandwidth);
+        ImGui::TableNextColumn();
+        ImVec4 pcieColor = GetStatusColor(bandwidth.pcieUtilization, 0.0f, 80.0f, true);
+        ImGui::TextColored(pcieColor, "%.1f%%", bandwidth.pcieUtilization);
+        
+        // 2. 内存带宽（CPU 与 RAM 的桥梁）- 汇总信息
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("内存带宽 (汇总)");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(CPU ↔ RAM)");
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "%.2f GB/s", bandwidth.memoryMaxBandwidth);
+        ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "(%s %d MHz)", 
+                          bandwidth.memoryType.c_str(), bandwidth.memorySpeed);
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%.2f GB/s", bandwidth.memoryRealTimeBandwidth);
+        ImGui::TableNextColumn();
+        ImVec4 memColor = GetStatusColor(bandwidth.memoryUtilization, 0.0f, 80.0f, true);
+        ImGui::TextColored(memColor, "%.1f%%", bandwidth.memoryUtilization);
+        
+        // 3. 存储/IO 带宽（硬盘与内存的桥梁）
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("存储/IO 带宽");
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "(硬盘 ↔ 内存)");
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(0.2f, 0.6f, 1.0f, 1.0f), "%.2f GB/s", bandwidth.storageMaxBandwidth);
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%.2f GB/s", bandwidth.storageRealTimeBandwidth);
+        ImGui::TableNextColumn();
+        ImVec4 storageColor = GetStatusColor(bandwidth.storageUtilization, 0.0f, 80.0f, true);
+        ImGui::TextColored(storageColor, "%.1f%%", bandwidth.storageUtilization);
+        
+        // 4. 显存带宽（GPU 内部带宽 - 极重要）
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("显存带宽");
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "⭐ (GPU 内部)");
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%.2f GB/s", bandwidth.vramMaxBandwidth);
+        ImGui::TableNextColumn();
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), "%.2f GB/s", bandwidth.vramRealTimeBandwidth);
+        ImGui::TableNextColumn();
+        ImVec4 vramColor = GetStatusColor(bandwidth.vramUtilization, 0.0f, 80.0f, true);
+        ImGui::TextColored(vramColor, "%.1f%%", bandwidth.vramUtilization);
+        
+        ImGui::EndTable();
     }
 }
 

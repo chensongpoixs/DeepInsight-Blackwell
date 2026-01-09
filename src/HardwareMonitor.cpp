@@ -6,9 +6,15 @@
 #include <iostream>
 #include <cerrno>
 #include <nvml.h>
+#include <comdef.h>
+#include <Wbemidl.h>
+#include <sstream>
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
 
 HardwareMonitor::HardwareMonitor() {
     GetSystemInfo(&sysInfo_);
@@ -79,6 +85,8 @@ void HardwareMonitor::Update() {
     UpdateGPU();
     UpdateCPU();
     UpdateMemory();
+    UpdateMemoryModules();
+    UpdateDisks();
     UpdateSystemBandwidth();
 }
 
@@ -399,64 +407,505 @@ void HardwareMonitor::UpdateMemory() {
     }
 }
 
-void HardwareMonitor::UpdateSystemBandwidth() {
-    // 计算总 PCIe 带宽（所有 GPU 的总和）
-    float totalPcieBandwidth = 0.0f;
-    for (const auto& gpu : gpuInfos_) {
-        if (gpu.available) {
-            totalPcieBandwidth += gpu.pcieBandwidth;
+void HardwareMonitor::UpdateMemoryModules() {
+    // 使用WMI获取真实的内存条信息
+    static bool wmiInitialized = false;
+    static bool wmiAvailable = false;
+    
+    if (!wmiInitialized) {
+        // 尝试初始化WMI（只初始化一次）
+        HRESULT hres = CoInitializeEx(0, COINIT_MULTITHREADED);
+        if (SUCCEEDED(hres) || hres == RPC_E_CHANGED_MODE) {
+            hres = CoInitializeSecurity(NULL, -1, NULL, NULL,
+                RPC_C_AUTHN_LEVEL_DEFAULT, RPC_C_IMP_LEVEL_IMPERSONATE,
+                NULL, EOAC_NONE, NULL);
+            wmiAvailable = (SUCCEEDED(hres) || hres == RPC_E_TOO_LATE);
+        }
+        wmiInitialized = true;
+    }
+    
+    bool modulesUpdated = false;
+    
+    if (wmiAvailable) {
+        // 使用WMI获取内存条信息
+        IWbemLocator* pLoc = nullptr;
+        HRESULT hres = CoCreateInstance(CLSID_WbemLocator, 0, CLSCTX_INPROC_SERVER,
+            IID_IWbemLocator, (LPVOID*)&pLoc);
+        
+        if (SUCCEEDED(hres)) {
+            IWbemServices* pSvc = nullptr;
+            hres = pLoc->ConnectServer(_bstr_t(L"ROOT\\CIMV2"), NULL, NULL, 0, NULL, 0, 0, &pSvc);
+            
+            if (SUCCEEDED(hres)) {
+                hres = CoSetProxyBlanket(pSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                    RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE);
+                
+                if (SUCCEEDED(hres)) {
+                    IEnumWbemClassObject* pEnumerator = nullptr;
+                    hres = pSvc->ExecQuery(bstr_t("WQL"),
+                        bstr_t("SELECT Capacity, Speed, MemoryType, DeviceLocator FROM Win32_PhysicalMemory"),
+                        WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY, NULL, &pEnumerator);
+                    
+                    if (SUCCEEDED(hres)) {
+                        memoryInfo_.modules.clear();
+                        IWbemClassObject* pclsObj = nullptr;
+                        ULONG uReturn = 0;
+                        size_t moduleIndex = 0;
+                        
+                        while (pEnumerator->Next(WBEM_INFINITE, 1, &pclsObj, &uReturn) == WBEM_S_NO_ERROR && uReturn > 0) {
+                            MemoryModuleInfo module;
+                            
+                            // 获取容量
+                            VARIANT vtProp;
+                            if (SUCCEEDED(pclsObj->Get(L"Capacity", 0, &vtProp, 0, 0))) {
+                                if (vtProp.vt == VT_BSTR) {
+                                    unsigned long long capacity = _wtoi64(vtProp.bstrVal);
+                                    module.capacity = static_cast<float>(capacity) / (1024.0f * 1024.0f * 1024.0f); // GB
+                                } else if (vtProp.vt == VT_I8 || vtProp.vt == VT_UI8) {
+                                    module.capacity = static_cast<float>(vtProp.ullVal) / (1024.0f * 1024.0f * 1024.0f); // GB
+                                }
+                                VariantClear(&vtProp);
+                            }
+                            
+                            // 获取速度
+                            if (SUCCEEDED(pclsObj->Get(L"Speed", 0, &vtProp, 0, 0))) {
+                                if (vtProp.vt == VT_UI4) {
+                                    module.speed = vtProp.ulVal;
+                                } else if (vtProp.vt == VT_UI2) {
+                                    module.speed = vtProp.uiVal;
+                                }
+                                VariantClear(&vtProp);
+                            }
+                            
+                            // 获取内存类型
+                            if (SUCCEEDED(pclsObj->Get(L"MemoryType", 0, &vtProp, 0, 0))) {
+                                unsigned int memType = 0;
+                                if (vtProp.vt == VT_UI2) {
+                                    memType = vtProp.uiVal;
+                                } else if (vtProp.vt == VT_UI4) {
+                                    memType = vtProp.ulVal;
+                                }
+                                
+                                // 转换内存类型代码为字符串
+                                switch (memType) {
+                                case 20: module.type = "DDR"; break;
+                                case 21: module.type = "DDR2"; break;
+                                case 24: module.type = "DDR3"; break;
+                                case 26: module.type = "DDR4"; break;
+                                case 34: case 35: module.type = "DDR5"; break;
+                                default: module.type = "Unknown"; break;
+                                }
+                                VariantClear(&vtProp);
+                            }
+                            
+                            // 获取设备位置
+                            if (SUCCEEDED(pclsObj->Get(L"DeviceLocator", 0, &vtProp, 0, 0))) {
+                                if (vtProp.vt == VT_BSTR && vtProp.bstrVal) {
+                                    _bstr_t bstrLocator(vtProp.bstrVal);
+                                    char* pLocator = bstrLocator;
+                                    if (pLocator) {
+                                        module.name = std::string(pLocator);
+                                    } else {
+                                        module.name = "内存条 " + std::to_string(moduleIndex + 1);
+                                    }
+                                } else {
+                                    module.name = "内存条 " + std::to_string(moduleIndex + 1);
+                                }
+                                VariantClear(&vtProp);
+                            } else {
+                                module.name = "内存条 " + std::to_string(moduleIndex + 1);
+                            }
+                            
+                            // 估算通道（基于索引，假设双通道）
+                            module.channel = static_cast<unsigned int>(moduleIndex % 2);
+                            
+                            // 如果没有获取到速度，使用默认值
+                            if (module.speed == 0) {
+                                if (module.type == "DDR5") {
+                                    module.speed = 4800;
+                                } else if (module.type == "DDR4") {
+                                    module.speed = 3200;
+                                } else if (module.type == "DDR3") {
+                                    module.speed = 1600;
+                                } else {
+                                    module.speed = 2400;
+                                }
+                            }
+                            
+                            // 计算单条内存的最大带宽
+                            // 单通道带宽 = 速度(MHz) * 64bit / 8 / 1000
+                            module.maxBandwidth = (static_cast<float>(module.speed) * 64.0f) / 8.0f / 1000.0f; // GB/s
+                            
+                            memoryInfo_.modules.push_back(module);
+                            moduleIndex++;
+                            
+                            pclsObj->Release();
+                        }
+                        
+                        pEnumerator->Release();
+                        modulesUpdated = true;
+                    }
+                    
+                    pSvc->Release();
+                }
+                
+                pLoc->Release();
+            }
         }
     }
-    systemBandwidthInfo_.pcieTotalBandwidth = totalPcieBandwidth;
+    
+    // 如果WMI失败或未初始化，使用估算方法
+    if (!modulesUpdated) {
+        MEMORYSTATUSEX memInfo;
+        memInfo.dwLength = sizeof(MEMORYSTATUSEX);
+        GlobalMemoryStatusEx(&memInfo);
+        
+        float totalMemGB = static_cast<float>(memInfo.ullTotalPhys) / (1024.0f * 1024.0f * 1024.0f);
+        
+        // 估算内存条数量（假设每个内存条8GB或16GB）
+        size_t estimatedModuleCount = 0;
+        if (totalMemGB >= 64.0f) {
+            estimatedModuleCount = static_cast<size_t>(totalMemGB / 16.0f + 0.5f);
+        } else if (totalMemGB >= 32.0f) {
+            estimatedModuleCount = static_cast<size_t>(totalMemGB / 8.0f + 0.5f);
+        } else {
+            estimatedModuleCount = static_cast<size_t>(totalMemGB / 4.0f + 0.5f);
+        }
+        
+        estimatedModuleCount = std::max(static_cast<size_t>(1), std::min(static_cast<size_t>(8), estimatedModuleCount));
+        
+        // 只在数量变化时重新初始化
+        if (memoryInfo_.modules.size() != estimatedModuleCount) {
+            memoryInfo_.modules.resize(estimatedModuleCount);
+            for (size_t i = 0; i < estimatedModuleCount; i++) {
+                MemoryModuleInfo& module = memoryInfo_.modules[i];
+                module.name = "内存条 " + std::to_string(i + 1);
+                module.capacity = totalMemGB / static_cast<float>(estimatedModuleCount);
+                module.channel = static_cast<unsigned int>(i % 2);
+                
+                if (totalMemGB >= 64.0f) {
+                    module.speed = 4800;
+                    module.type = "DDR5";
+                } else if (totalMemGB >= 32.0f) {
+                    module.speed = 3200;
+                    module.type = "DDR4";
+                } else {
+                    module.speed = 2400;
+                    module.type = "DDR4";
+                }
+                
+                module.maxBandwidth = (static_cast<float>(module.speed) * 64.0f) / 8.0f / 1000.0f;
+            }
+        }
+    }
+    
+    // 更新每个内存条的实时带宽和利用率
+    float memPercent = memoryInfo_.percent;
+    float cpuUtil = cpuInfo_.utilization;
+    
+    // 计算系统总带宽利用率（基于内存使用率和CPU利用率）
+    // 修复：不再乘以channelLoadFactor，这样利用率会更合理
+    float systemActivityFactor = (memPercent / 100.0f) * 0.5f + (cpuUtil / 100.0f) * 0.5f;
+    systemActivityFactor = std::max(0.0f, std::min(1.0f, systemActivityFactor));
+    
+    for (size_t i = 0; i < memoryInfo_.modules.size(); i++) {
+        MemoryModuleInfo& module = memoryInfo_.modules[i];
+        
+        // 实时带宽 = 最大带宽 * 系统活动因子
+        // 每个内存条共享系统负载，但根据通道可能略有差异
+        float channelFactor = 1.0f;
+        if (memoryInfo_.modules.size() > 1) {
+            // 双通道时，负载可能略有不同
+            channelFactor = (module.channel == 0) ? 1.05f : 0.95f; // 通道0略高，通道1略低
+        }
+        
+        float activityFactor = systemActivityFactor * channelFactor;
+        activityFactor = std::max(0.0f, std::min(1.0f, activityFactor));
+        
+        module.realTimeBandwidth = module.maxBandwidth * activityFactor;
+        module.utilization = activityFactor * 100.0f;
+        
+        // 更新历史数据
+        module.bandwidthHistory.push_back(module.realTimeBandwidth);
+        if (module.bandwidthHistory.size() > MemoryModuleInfo::MAX_HISTORY) {
+            module.bandwidthHistory.erase(module.bandwidthHistory.begin());
+        }
+    }
+}
 
-    // 估算内存带宽（基于内存类型和速度）
-    // 这是一个简化的估算，实际值取决于内存配置
-    // DDR4-3200 双通道 ≈ 51.2 GB/s, DDR5-4800 双通道 ≈ 76.8 GB/s
+void HardwareMonitor::UpdateDisks() {
+    // 初始化磁盘查询（如果尚未初始化）
+    if (diskQuery_ == nullptr) {
+        PdhOpenQuery(nullptr, NULL, &diskQuery_);
+        
+        // 枚举所有逻辑磁盘
+        DWORD bufferSize = 0;
+        GetLogicalDriveStrings(bufferSize, nullptr);
+        bufferSize += 1;
+        std::vector<char> driveBuffer(bufferSize);
+        GetLogicalDriveStrings(bufferSize, driveBuffer.data());
+        
+        diskInfos_.clear();
+        diskCounters_.clear();
+        
+        for (char* drive = driveBuffer.data(); *drive; drive += strlen(drive) + 1) {
+            UINT driveType = GetDriveTypeA(drive);
+            if (driveType == DRIVE_FIXED) { // 只监控固定磁盘
+                DiskInfo disk;
+                disk.name = std::string(1, drive[0]) + ":";
+                
+                // 获取磁盘容量
+                ULARGE_INTEGER freeBytes, totalBytes;
+                if (GetDiskFreeSpaceExA(drive, nullptr, &totalBytes, &freeBytes)) {
+                    disk.totalSize = static_cast<float>(totalBytes.QuadPart) / (1024.0f * 1024.0f * 1024.0f); // GB
+                }
+                
+                // 估算磁盘类型和最大带宽
+                if (disk.totalSize > 1000.0f) {
+                    // 大容量，可能是HDD
+                    disk.type = "HDD";
+                    disk.model = "机械硬盘";
+                    disk.maxReadBandwidth = 0.2f;  // GB/s
+                    disk.maxWriteBandwidth = 0.15f; // GB/s
+                } else {
+                    // 较小容量，可能是SSD
+                    disk.type = "SSD";
+                    disk.model = "固态硬盘";
+                    disk.maxReadBandwidth = 3.5f;  // GB/s (NVMe PCIe 3.0估算)
+                    disk.maxWriteBandwidth = 2.5f; // GB/s
+                }
+                
+                diskInfos_.push_back(disk);
+                
+                // 创建PDH计数器 - 使用正确的路径格式
+                DiskCounter counter;
+                counter.diskName = disk.name;
+                
+                // PDH路径格式: \PhysicalDisk(0 C:)\Disk Read Bytes/sec
+                char driveLetter = drive[0];
+                std::string readPath = "\\PhysicalDisk(" + std::string(1, driveLetter) + ":)\\Disk Read Bytes/sec";
+                std::string writePath = "\\PhysicalDisk(" + std::string(1, driveLetter) + ":)\\Disk Write Bytes/sec";
+                
+                // 尝试添加计数器，如果失败则跳过
+                PDH_STATUS status1 = PdhAddCounterA(diskQuery_, readPath.c_str(), NULL, &counter.readCounter);
+                PDH_STATUS status2 = PdhAddCounterA(diskQuery_, writePath.c_str(), NULL, &counter.writeCounter);
+                
+                if (status1 == ERROR_SUCCESS && status2 == ERROR_SUCCESS) {
+                    diskCounters_.push_back(counter);
+                } else {
+                    // 如果PDH路径失败，尝试使用逻辑磁盘路径
+                    readPath = "\\LogicalDisk(" + std::string(1, driveLetter) + ":)\\Disk Read Bytes/sec";
+                    writePath = "\\LogicalDisk(" + std::string(1, driveLetter) + ":)\\Disk Write Bytes/sec";
+                    
+                    counter.readCounter = nullptr;
+                    counter.writeCounter = nullptr;
+                    status1 = PdhAddCounterA(diskQuery_, readPath.c_str(), NULL, &counter.readCounter);
+                    status2 = PdhAddCounterA(diskQuery_, writePath.c_str(), NULL, &counter.writeCounter);
+                    
+                    if (status1 == ERROR_SUCCESS && status2 == ERROR_SUCCESS) {
+                        diskCounters_.push_back(counter);
+                    }
+                }
+            }
+        }
+        
+        if (diskQuery_ != nullptr && !diskCounters_.empty()) {
+            PdhCollectQueryData(diskQuery_);
+        }
+    }
+    
+    // 更新磁盘IO数据
+    if (diskQuery_ != nullptr && !diskCounters_.empty()) {
+        PdhCollectQueryData(diskQuery_);
+        
+        for (size_t i = 0; i < diskInfos_.size() && i < diskCounters_.size(); i++) {
+            DiskInfo& disk = diskInfos_[i];
+            DiskCounter& counter = diskCounters_[i];
+            
+            // 读取读取速度
+            if (counter.readCounter != nullptr) {
+                PDH_FMT_COUNTERVALUE readValue;
+                if (PdhGetFormattedCounterValue(counter.readCounter, PDH_FMT_DOUBLE, NULL, &readValue) == ERROR_SUCCESS) {
+                    // 转换为GB/s
+                    disk.realTimeReadBandwidth = static_cast<float>(readValue.doubleValue) / (1024.0f * 1024.0f * 1024.0f);
+                    disk.readUtilization = (disk.maxReadBandwidth > 0.0f) ? 
+                        (disk.realTimeReadBandwidth / disk.maxReadBandwidth * 100.0f) : 0.0f;
+                }
+            }
+            
+            // 读取写入速度
+            if (counter.writeCounter != nullptr) {
+                PDH_FMT_COUNTERVALUE writeValue;
+                if (PdhGetFormattedCounterValue(counter.writeCounter, PDH_FMT_DOUBLE, NULL, &writeValue) == ERROR_SUCCESS) {
+                    // 转换为GB/s
+                    disk.realTimeWriteBandwidth = static_cast<float>(writeValue.doubleValue) / (1024.0f * 1024.0f * 1024.0f);
+                    disk.writeUtilization = (disk.maxWriteBandwidth > 0.0f) ? 
+                        (disk.realTimeWriteBandwidth / disk.maxWriteBandwidth * 100.0f) : 0.0f;
+                }
+            }
+            
+            // 更新历史数据
+            disk.readBandwidthHistory.push_back(disk.realTimeReadBandwidth);
+            disk.writeBandwidthHistory.push_back(disk.realTimeWriteBandwidth);
+            
+            if (disk.readBandwidthHistory.size() > DiskInfo::MAX_HISTORY) {
+                disk.readBandwidthHistory.erase(disk.readBandwidthHistory.begin());
+            }
+            if (disk.writeBandwidthHistory.size() > DiskInfo::MAX_HISTORY) {
+                disk.writeBandwidthHistory.erase(disk.writeBandwidthHistory.begin());
+            }
+        }
+    }
+}
+
+void HardwareMonitor::UpdateSystemBandwidth() {
+    // ========== 1. PCIe 总线带宽（CPU 与 GPU 的桥梁）==========
+    float totalPcieMaxBandwidth = 0.0f;
+    float totalPcieRealTimeBandwidth = 0.0f;
+    
+    for (const auto& gpu : gpuInfos_) {
+        if (gpu.available) {
+            // 最大带宽 = 理论PCIe带宽
+            totalPcieMaxBandwidth += gpu.pcieBandwidth;
+            // 实时带宽 = 实际吞吐量（接收 + 发送）
+            totalPcieRealTimeBandwidth += (gpu.pcieRxThroughput + gpu.pcieTxThroughput) / 1024.0f; // 转换为GB/s
+        }
+    }
+    
+    systemBandwidthInfo_.pcieMaxBandwidth = totalPcieMaxBandwidth;
+    systemBandwidthInfo_.pcieRealTimeBandwidth = totalPcieRealTimeBandwidth;
+    systemBandwidthInfo_.pcieUtilization = (totalPcieMaxBandwidth > 0.0f) ? 
+        (totalPcieRealTimeBandwidth / totalPcieMaxBandwidth * 100.0f) : 0.0f;
+    
+    // 兼容性字段
+    systemBandwidthInfo_.pcieTotalBandwidth = totalPcieMaxBandwidth;
+
+    // ========== 2. 内存带宽（CPU 与 RAM 的桥梁）==========
     MEMORYSTATUSEX memInfo;
     memInfo.dwLength = sizeof(MEMORYSTATUSEX);
     GlobalMemoryStatusEx(&memInfo);
     
-    // 根据总内存大小估算内存类型和速度
     float totalMemGB = static_cast<float>(memInfo.ullTotalPhys) / (1024.0f * 1024.0f * 1024.0f);
-    if (totalMemGB >= 32.0f) {
-        // 假设是较新的系统，使用 DDR4/DDR5
-        systemBandwidthInfo_.memoryBandwidth = 50.0f; // GB/s (保守估算)
-        systemBandwidthInfo_.memoryType = "DDR4/DDR5";
-        systemBandwidthInfo_.memorySpeed = 3200; // MHz
+    
+    // 估算最大内存带宽（基于内存类型和速度）
+    // DDR4-3200 双通道 ≈ 51.2 GB/s, DDR5-4800 双通道 ≈ 76.8 GB/s
+    float memoryMaxBW = 0.0f;
+    if (totalMemGB >= 64.0f) {
+        // 大内存系统，可能是DDR5或高端DDR4
+        memoryMaxBW = 60.0f; // GB/s
+        systemBandwidthInfo_.memoryType = "DDR5/DDR4";
+        systemBandwidthInfo_.memorySpeed = 4800;
+    } else if (totalMemGB >= 32.0f) {
+        // 中等内存系统，DDR4
+        memoryMaxBW = 50.0f; // GB/s
+        systemBandwidthInfo_.memoryType = "DDR4";
+        systemBandwidthInfo_.memorySpeed = 3200;
     } else {
-        // 较旧的系统
-        systemBandwidthInfo_.memoryBandwidth = 25.0f; // GB/s
+        // 较小内存系统
+        memoryMaxBW = 25.0f; // GB/s
         systemBandwidthInfo_.memoryType = "DDR3/DDR4";
-        systemBandwidthInfo_.memorySpeed = 2400; // MHz
+        systemBandwidthInfo_.memorySpeed = 2400;
     }
+    
+    systemBandwidthInfo_.memoryMaxBandwidth = memoryMaxBW;
+    
+    // 估算实时内存带宽（基于内存使用率和CPU活动）
+    // 内存带宽利用率与内存使用率和CPU利用率相关
+    float memPercent = memoryInfo_.percent; // 已在UpdateMemory中更新
+    float cpuUtil = cpuInfo_.utilization;   // 已在UpdateCPU中更新
+    float memoryActivityFactor = (memPercent / 100.0f) * 0.6f + 
+                                 (cpuUtil / 100.0f) * 0.4f;
+    systemBandwidthInfo_.memoryRealTimeBandwidth = memoryMaxBW * memoryActivityFactor;
+    systemBandwidthInfo_.memoryUtilization = memoryActivityFactor * 100.0f;
+    
+    // 兼容性字段
+    systemBandwidthInfo_.memoryBandwidth = memoryMaxBW;
+    systemBandwidthInfo_.cpuBandwidth = memoryMaxBW * 1.2f; // CPU带宽估算
 
-    // 估算CPU带宽（基于CPU核心数和内存带宽）
-    // CPU带宽通常与内存带宽相关，现代CPU通常支持双通道或更多通道
-    // 这里使用内存带宽作为基础，CPU带宽通常略高于内存带宽
-    systemBandwidthInfo_.cpuBandwidth = systemBandwidthInfo_.memoryBandwidth * 1.2f; // 估算为内存带宽的1.2倍
+    // ========== 3. 存储/IO 带宽（硬盘与内存的桥梁）==========
+    // 估算存储最大带宽（基于常见存储接口）
+    // SATA3 ≈ 0.6 GB/s, NVMe PCIe 3.0 x4 ≈ 3.5 GB/s, NVMe PCIe 4.0 x4 ≈ 7.0 GB/s
+    // 这里使用保守估算，假设是NVMe PCIe 3.0
+    systemBandwidthInfo_.storageMaxBandwidth = 3.5f; // GB/s (保守估算)
+    
+    // 估算实时存储带宽（基于内存活动）
+    // 存储带宽利用率与内存使用率相关（内存不足时会频繁读写磁盘）
+      memPercent = memoryInfo_.percent; // 已在UpdateMemory中更新
+    float storageActivityFactor = 0.0f;
+    if (memPercent > 90.0f) {
+        // 内存接近满载，可能有频繁的Swap操作
+        storageActivityFactor = 0.3f + (memPercent - 90.0f) / 10.0f * 0.4f; // 30%-70%
+    } else if (memPercent > 80.0f) {
+        // 内存使用较高，可能有少量IO
+        storageActivityFactor = 0.1f + (memPercent - 80.0f) / 10.0f * 0.2f; // 10%-30%
+    } else {
+        // 内存充足，IO活动较少
+        storageActivityFactor = memPercent / 80.0f * 0.1f; // 0%-10%
+    }
+    
+    systemBandwidthInfo_.storageRealTimeBandwidth = systemBandwidthInfo_.storageMaxBandwidth * storageActivityFactor;
+    systemBandwidthInfo_.storageUtilization = storageActivityFactor * 100.0f;
 
-    // 总系统带宽（主板总带宽）= CPU带宽 + 内存带宽 + PCIe带宽
+    // ========== 4. 显存带宽（GPU 内部带宽 - 极重要）==========
+    float totalVramMaxBandwidth = 0.0f;
+    float totalVramRealTimeBandwidth = 0.0f;
+    
+    for (const auto& gpu : gpuInfos_) {
+        if (gpu.available && gpu.memoryClock > 0) {
+            // 显存带宽计算公式：带宽(GB/s) = 显存时钟(MHz) * 位宽(bits) / 8 / 1000
+            // 常见GPU显存位宽：128bit, 192bit, 256bit, 320bit, 384bit
+            // 这里使用估算值，基于显存时钟频率
+            // 假设位宽为256bit（常见的中高端GPU）
+            unsigned int memoryBusWidth = 256; // bits (估算值)
+            float vramMaxBW = (static_cast<float>(gpu.memoryClock) * memoryBusWidth) / 8.0f / 1000.0f; // GB/s
+            
+            totalVramMaxBandwidth += vramMaxBW;
+            
+            // 实时显存带宽 = 最大带宽 * 显存控制器负载
+            float vramActivityFactor = gpu.memoryControllerLoad / 100.0f;
+            totalVramRealTimeBandwidth += vramMaxBW * vramActivityFactor;
+        }
+    }
+    
+    systemBandwidthInfo_.vramMaxBandwidth = totalVramMaxBandwidth;
+    systemBandwidthInfo_.vramRealTimeBandwidth = totalVramRealTimeBandwidth;
+    systemBandwidthInfo_.vramUtilization = (totalVramMaxBandwidth > 0.0f) ? 
+        (totalVramRealTimeBandwidth / totalVramMaxBandwidth * 100.0f) : 0.0f;
+
+    // ========== 总系统带宽（主板总带宽）==========
+    // 总系统带宽 = PCIe最大带宽 + 内存最大带宽 + 存储最大带宽 + 显存最大带宽
     systemBandwidthInfo_.totalSystemBandwidth = 
-        systemBandwidthInfo_.cpuBandwidth + 
-        systemBandwidthInfo_.memoryBandwidth + 
-        systemBandwidthInfo_.pcieTotalBandwidth;
+        systemBandwidthInfo_.pcieMaxBandwidth + 
+        systemBandwidthInfo_.memoryMaxBandwidth + 
+        systemBandwidthInfo_.storageMaxBandwidth + 
+        systemBandwidthInfo_.vramMaxBandwidth;
 
-    // 更新历史数据
+    // ========== 更新历史数据 ==========
     systemBandwidthInfo_.totalBandwidthHistory.push_back(systemBandwidthInfo_.totalSystemBandwidth);
     systemBandwidthInfo_.cpuBandwidthHistory.push_back(systemBandwidthInfo_.cpuBandwidth);
-    systemBandwidthInfo_.memoryBandwidthHistory.push_back(systemBandwidthInfo_.memoryBandwidth);
+    systemBandwidthInfo_.memoryBandwidthHistory.push_back(systemBandwidthInfo_.memoryMaxBandwidth);
+    systemBandwidthInfo_.pcieBandwidthHistory.push_back(systemBandwidthInfo_.pcieRealTimeBandwidth);
+    systemBandwidthInfo_.storageBandwidthHistory.push_back(systemBandwidthInfo_.storageRealTimeBandwidth);
+    systemBandwidthInfo_.vramBandwidthHistory.push_back(systemBandwidthInfo_.vramRealTimeBandwidth);
     
+    // 限制历史数据大小
     if (systemBandwidthInfo_.totalBandwidthHistory.size() > SystemBandwidthInfo::MAX_HISTORY) {
-        systemBandwidthInfo_.totalBandwidthHistory.erase(
-            systemBandwidthInfo_.totalBandwidthHistory.begin());
+        systemBandwidthInfo_.totalBandwidthHistory.erase(systemBandwidthInfo_.totalBandwidthHistory.begin());
     }
     if (systemBandwidthInfo_.cpuBandwidthHistory.size() > SystemBandwidthInfo::MAX_HISTORY) {
-        systemBandwidthInfo_.cpuBandwidthHistory.erase(
-            systemBandwidthInfo_.cpuBandwidthHistory.begin());
+        systemBandwidthInfo_.cpuBandwidthHistory.erase(systemBandwidthInfo_.cpuBandwidthHistory.begin());
     }
     if (systemBandwidthInfo_.memoryBandwidthHistory.size() > SystemBandwidthInfo::MAX_HISTORY) {
-        systemBandwidthInfo_.memoryBandwidthHistory.erase(
-            systemBandwidthInfo_.memoryBandwidthHistory.begin());
+        systemBandwidthInfo_.memoryBandwidthHistory.erase(systemBandwidthInfo_.memoryBandwidthHistory.begin());
+    }
+    if (systemBandwidthInfo_.pcieBandwidthHistory.size() > SystemBandwidthInfo::MAX_HISTORY) {
+        systemBandwidthInfo_.pcieBandwidthHistory.erase(systemBandwidthInfo_.pcieBandwidthHistory.begin());
+    }
+    if (systemBandwidthInfo_.storageBandwidthHistory.size() > SystemBandwidthInfo::MAX_HISTORY) {
+        systemBandwidthInfo_.storageBandwidthHistory.erase(systemBandwidthInfo_.storageBandwidthHistory.begin());
+    }
+    if (systemBandwidthInfo_.vramBandwidthHistory.size() > SystemBandwidthInfo::MAX_HISTORY) {
+        systemBandwidthInfo_.vramBandwidthHistory.erase(systemBandwidthInfo_.vramBandwidthHistory.begin());
     }
 }
 
@@ -470,12 +919,35 @@ void HardwareMonitor::Shutdown() {
         PdhCloseQuery(cpuQuery_);
         cpuQuery_ = nullptr;
     }
+    
+    if (diskQuery_) {
+        // 关闭所有磁盘计数器
+        for (auto& counter : diskCounters_) {
+            if (counter.readCounter) {
+                PdhRemoveCounter(counter.readCounter);
+            }
+            if (counter.writeCounter) {
+                PdhRemoveCounter(counter.writeCounter);
+            }
+        }
+        diskCounters_.clear();
+        PdhCloseQuery(diskQuery_);
+        diskQuery_ = nullptr;
+    }
 }
 
 const GPUInfo& HardwareMonitor::GetGPUInfo(int index) const {
     static GPUInfo empty;
     if (index >= 0 && index < static_cast<int>(gpuInfos_.size())) {
         return gpuInfos_[index];
+    }
+    return empty;
+}
+
+const DiskInfo& HardwareMonitor::GetDiskInfo(size_t index) const {
+    static DiskInfo empty;
+    if (index < diskInfos_.size()) {
+        return diskInfos_[index];
     }
     return empty;
 }
