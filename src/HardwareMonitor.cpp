@@ -162,41 +162,62 @@ void HardwareMonitor::UpdateGPU() {
         }
 
         // 获取电压信息
-        // NVML可能不直接提供电压API，这里使用功耗和性能状态估算
-        // 或者尝试使用nvmlDeviceGetPowerManagementLimitConstraints获取功耗限制
-        unsigned int voltage = 0;
-        nvmlReturn_t voltageResult = nvmlDeviceGetVoltage(device, NVML_VOLTAGE_GPU, &voltage);
-        if (voltageResult == NVML_SUCCESS) {
-            // NVML返回的电压单位是毫伏(mV)
-            gpu.currentVoltage = static_cast<float>(voltage);
-        } else {
-            // 如果无法直接获取，使用功耗估算电压（简化方法）
-            // 假设电压与功耗相关：V = sqrt(P / R)，这里使用简化的线性关系
-            if (gpu.powerUsage > 0) {
-                // 估算：假设最大功耗对应最大电压，当前功耗对应当前电压
-                // 这是一个简化的估算，实际应该通过其他方式获取
-                float estimatedVoltage = 800.0f + (gpu.powerUsage / 100.0f) * 200.0f; // 800-1000mV范围
-                gpu.currentVoltage = estimatedVoltage;
-            } else {
-                gpu.currentVoltage = 0.0f;
-            }
+        // 注意：NVML API 不提供直接获取 GPU 电压的函数
+        // 这里使用基于功耗和性能状态的估算方法
+        // 电压与功耗的关系：P = V^2 / R，因此 V ≈ sqrt(P * R)
+        // 这里使用简化的线性关系进行估算
+        
+        // 获取功耗限制（用于估算最大电压）
+        unsigned int minPowerLimit = 0;
+        unsigned int maxPowerLimit = 0;
+        bool hasPowerLimit = false;
+        
+        if (nvmlDeviceGetPowerManagementLimitConstraints(device, &minPowerLimit, &maxPowerLimit) == NVML_SUCCESS) {
+            hasPowerLimit = true;
         }
         
-        // 获取最大电压（通常从功耗限制或性能状态获取）
-        // 这里使用一个合理的默认值，或者从功耗限制估算
-        unsigned int powerLimit;
-        if (nvmlDeviceGetPowerManagementLimitConstraints(device, nullptr, &powerLimit) == NVML_SUCCESS) {
-            // 基于功耗限制估算最大电压
-            float estimatedMaxVoltage = 800.0f + (static_cast<float>(powerLimit) / 1000.0f) * 200.0f;
-            gpu.maxVoltage = estimatedMaxVoltage;
+        // 估算最大电压（单位：V）
+        // 大多数现代GPU的最大电压在1.0-1.2V之间
+        // 基于功耗限制估算：高功耗GPU通常有更高的电压
+        if (hasPowerLimit && maxPowerLimit > 0) {
+            // 估算公式：0.8V + (功耗限制/1000W) * 0.4V
+            // 例如：300W GPU ≈ 0.92V, 450W GPU ≈ 0.98V
+            float powerLimitW = static_cast<float>(maxPowerLimit) / 1000.0f;
+            gpu.maxVoltage = 0.8f + powerLimitW * 0.0004f; // 0.8-1.0V范围
+            gpu.maxVoltage = std::min(1.2f, std::max(0.8f, gpu.maxVoltage)); // 限制在合理范围
         } else {
-            // 使用默认值（大多数现代GPU的最大电压在1000-1200mV之间）
-            gpu.maxVoltage = 1000.0f; // 默认1000mV
+            // 使用默认值（大多数现代GPU的最大电压在1.0-1.2V之间）
+            gpu.maxVoltage = 1.0f; // 默认1.0V
+        }
+        
+        // 估算实时电压（基于当前功耗，单位：V）
+        if (gpu.powerUsage > 0 && gpu.maxVoltage > 0.0f) {
+            // 使用功耗百分比估算电压
+            // 假设：功耗与电压的平方成正比（P = V^2 / R）
+            // 简化：V ≈ V_max * sqrt(P / P_max)
+            float powerPercent = 0.0f;
+            if (hasPowerLimit && maxPowerLimit > 0) {
+                float maxPowerW = static_cast<float>(maxPowerLimit) / 1000.0f;
+                powerPercent = (static_cast<float>(gpu.powerUsage) / maxPowerW) * 100.0f;
+                powerPercent = std::min(100.0f, std::max(0.0f, powerPercent));
+            } else {
+                // 如果没有功耗限制，使用简化的线性关系
+                // 假设：功耗在0-100%时，电压在0.8-1.0V
+                powerPercent = std::min(100.0f, (static_cast<float>(gpu.powerUsage) / 300.0f) * 100.0f);
+            }
+            
+            // 使用平方根关系估算电压（更符合物理规律）
+            float voltageRatio = sqrtf(powerPercent / 100.0f);
+            gpu.currentVoltage = 0.8f + (gpu.maxVoltage - 0.8f) * voltageRatio;
+            gpu.currentVoltage = std::min(gpu.maxVoltage, std::max(0.8f, gpu.currentVoltage));
+        } else {
+            // 如果没有功耗数据，使用默认值
+            gpu.currentVoltage = 0.0f;
         }
         
         // 计算电压百分比
-        if (gpu.maxVoltage > 0.0f) {
-            gpu.voltagePercent = (gpu.currentVoltage / gpu.maxVoltage) * 100.0f;
+        if (gpu.maxVoltage > 0.0f && gpu.currentVoltage > 0.0f) {
+            gpu.voltagePercent = ((gpu.currentVoltage - 0.8f) / (gpu.maxVoltage - 0.8f)) * 100.0f;
             gpu.voltagePercent = std::min(100.0f, std::max(0.0f, gpu.voltagePercent));
         } else {
             gpu.voltagePercent = 0.0f;
@@ -246,13 +267,84 @@ void HardwareMonitor::UpdateGPU() {
         // 2. 使用 CUDA 事件监控数据传输
         // 3. 使用性能计数器（如果系统支持）
 
-        // 估算数据传输等待时间（基于 PCIe 利用率）
-        // 这是一个简化的估算，实际等待时间取决于数据传输量和带宽
+        // 估算CPU到GPU数据传输等待时间
+        // 等待时间主要取决于：
+        // 1. GPU显存控制器负载（高负载时数据传输可能排队）
+        // 2. GPU利用率（GPU忙碌时可能无法及时处理数据传输）
+        // 3. PCIe带宽利用率（带宽饱和时会有延迟）
+        // 4. 显存使用率（显存接近满载时可能有延迟）
+        
+        gpu.dataTransferWaitTime = 0.0f; // 默认无等待
+        
         if (gpu.pcieBandwidth > 0.0f) {
-            float pcieUtilization = ((gpu.pcieRxThroughput + gpu.pcieTxThroughput) / 1024.0f) / gpu.pcieBandwidth * 100.0f;
-            // 高利用率时，等待时间会增加
-            gpu.dataTransferWaitTime = pcieUtilization > 80.0f ? 
-                (pcieUtilization - 80.0f) * 0.1f : 0.0f; // 毫秒
+            // 计算PCIe利用率（基于估算的吞吐量）
+            float pcieUtilization = 0.0f;
+            if (gpu.pcieRxThroughput > 0.0f || gpu.pcieTxThroughput > 0.0f) {
+                float totalThroughputGB = (gpu.pcieRxThroughput + gpu.pcieTxThroughput) / 1024.0f;
+                pcieUtilization = (totalThroughputGB / gpu.pcieBandwidth) * 100.0f;
+                pcieUtilization = std::max(0.0f, std::min(100.0f, pcieUtilization));
+            }
+            
+            // 因子1：显存控制器负载（这是最直接的指标）
+            // 显存控制器负载高时，数据传输会排队等待
+            float memoryControllerFactor = gpu.memoryControllerLoad / 100.0f;
+            
+            // 因子2：GPU利用率（GPU忙碌时，数据传输可能被延迟处理）
+            float gpuUtilizationFactor = gpu.utilization / 100.0f;
+            
+            // 因子3：PCIe利用率（带宽饱和时会有延迟）
+            float pcieUtilizationFactor = pcieUtilization / 100.0f;
+            
+            // 因子4：显存使用率（显存接近满载时，新数据传输可能需要等待空间）
+            float memoryUsageFactor = gpu.memoryPercent / 100.0f;
+            
+            // 综合计算等待时间（毫秒）
+            // 等待时间主要由显存控制器负载和GPU利用率决定
+            // 当这些指标高时，CPU到GPU的数据传输需要等待
+            
+            float baseWaitTime = 0.0f;
+            
+            // 基础等待时间：显存控制器负载是主要因素
+            if (memoryControllerFactor > 0.7f) {
+                // 显存控制器高负载时，等待时间显著增加
+                baseWaitTime = (memoryControllerFactor - 0.7f) * 5.0f; // 0-1.5ms
+            }
+            
+            // GPU利用率影响：GPU忙碌时，数据传输可能被延迟
+            if (gpuUtilizationFactor > 0.8f) {
+                baseWaitTime += (gpuUtilizationFactor - 0.8f) * 3.0f; // 0-0.6ms
+            }
+            
+            // PCIe带宽饱和影响：带宽利用率高时，数据传输会排队
+            if (pcieUtilizationFactor > 0.75f) {
+                baseWaitTime += (pcieUtilizationFactor - 0.75f) * 4.0f; // 0-1.0ms
+            }
+            
+            // 显存使用率影响：显存接近满载时，新数据传输需要等待
+            if (memoryUsageFactor > 0.85f) {
+                baseWaitTime += (memoryUsageFactor - 0.85f) * 2.0f; // 0-0.3ms
+            }
+            
+            // 当GPU和显存都处于低负载时，即使有数据传输，等待时间也很短
+            if (gpuUtilizationFactor < 0.3f && memoryControllerFactor < 0.3f) {
+                baseWaitTime *= 0.3f; // 低负载时，等待时间大幅减少
+            }
+            
+            gpu.dataTransferWaitTime = baseWaitTime;
+            
+            // 限制等待时间在合理范围内（0-10ms）
+            gpu.dataTransferWaitTime = std::max(0.0f, std::min(10.0f, gpu.dataTransferWaitTime));
+        } else {
+            // 如果没有PCIe带宽信息，基于GPU和显存控制器负载估算
+            float memoryControllerFactor = gpu.memoryControllerLoad / 100.0f;
+            float gpuUtilizationFactor = gpu.utilization / 100.0f;
+            
+            if (memoryControllerFactor > 0.7f || gpuUtilizationFactor > 0.8f) {
+                gpu.dataTransferWaitTime = (memoryControllerFactor * 2.0f + gpuUtilizationFactor * 1.0f);
+                gpu.dataTransferWaitTime = std::max(0.0f, std::min(5.0f, gpu.dataTransferWaitTime));
+            } else {
+                gpu.dataTransferWaitTime = 0.0f;
+            }
         }
 
         // 更新历史数据

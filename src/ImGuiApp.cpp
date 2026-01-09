@@ -14,6 +14,10 @@
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
+#include <windows.h>
+#include <shlobj.h>
+#include <vector>
+#include <string>
 #endif
 
 ImGuiApp::ImGuiApp(const std::string& title, int width, int height)
@@ -53,8 +57,8 @@ bool ImGuiApp::Initialize() {
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     
-    // 设置中文字体支持
-    // 尝试使用 Windows 系统字体
+    // 设置中文字体和emoji支持
+    // 首先加载中文字体
     const char* fontPaths[] = {
         "C:/Windows/Fonts/msyh.ttc",           // 微软雅黑
         "C:/Windows/Fonts/simhei.ttf",          // 黑体
@@ -64,29 +68,192 @@ bool ImGuiApp::Initialize() {
     };
     
     ImFont* font = nullptr;
+    ImFontConfig fontConfig;
+    fontConfig.OversampleH = 3;  // 提高中文字体渲染质量
+    fontConfig.OversampleV = 1;
+    
     for (int i = 0; fontPaths[i] != nullptr; i++) {
-        // 检查文件是否存在
+        // 检查文件是否存在（使用二进制模式）
         FILE* testFile = nullptr;
-        if (fopen_s(&testFile, fontPaths[i], "r") == 0 && testFile != nullptr) {
+        if (fopen_s(&testFile, fontPaths[i], "rb") == 0 && testFile != nullptr) {
             fclose(testFile);
             // 加载字体，包含中文字符范围
-            font = io.Fonts->AddFontFromFileTTF(fontPaths[i], 16.0f, nullptr, 
+            // 使用更大的字体大小以确保清晰度
+            font = io.Fonts->AddFontFromFileTTF(fontPaths[i], 18.0f, &fontConfig, 
                                                  io.Fonts->GetGlyphRangesChineseFull());
             if (font != nullptr) {
-                std::cout << "成功加载字体: " << fontPaths[i] << std::endl;
+                std::cout << "成功加载中文字体: " << fontPaths[i] << " (18px)" << std::endl;
                 break;
+            } else {
+                // 如果18px失败，尝试16px
+                font = io.Fonts->AddFontFromFileTTF(fontPaths[i], 16.0f, &fontConfig, 
+                                                     io.Fonts->GetGlyphRangesChineseFull());
+                if (font != nullptr) {
+                    std::cout << "成功加载中文字体: " << fontPaths[i] << " (16px)" << std::endl;
+                    break;
+                } else {
+                    std::cout << "加载字体失败: " << fontPaths[i] << std::endl;
+                }
             }
+        } else {
+            std::cout << "字体文件不存在: " << fontPaths[i] << std::endl;
         }
     }
     
     // 如果系统字体加载失败，使用默认字体
     if (font == nullptr) {
-        io.Fonts->AddFontDefault();
-        std::cout << "使用默认字体（可能不支持中文）" << std::endl;
+        font = io.Fonts->AddFontDefault();
+        std::cout << "警告: 使用默认字体（可能不支持中文，会出现乱码）" << std::endl;
     }
     
-    // 注意：新版本的 ImGui 后端会自动构建字体纹理，不需要手动调用 Build()
-    // 字体会在第一次渲染时自动构建
+    // 重要：确保主字体已设置，这是MergeMode工作的前提
+    if (font != nullptr) {
+        io.FontDefault = font;
+        std::cout << "主字体已设置为默认字体" << std::endl;
+    }
+    
+    // 合并emoji字体支持（使用Windows系统emoji字体）
+    // Windows 10+ 通常使用 Segoe UI Emoji，但字体文件可能在不同位置
+    const char* emojiFontPaths[] = {
+        "C:/Windows/Fonts/SegoeIcons.ttf",     // Segoe Icons (Windows 10+)
+        "C:/Windows/Fonts/seguiemj.ttf",       // Segoe UI Emoji (Windows 10+)
+        "C:/Windows/Fonts/segmdl2.ttf",        // Segoe MDL2 Assets
+        "C:/Windows/Fonts/segoeui.ttf",        // Segoe UI (可能包含部分emoji)
+        nullptr
+    };
+    
+    ImFontConfig emojiConfig;
+    emojiConfig.MergeMode = true;  // 合并模式，将emoji合并到现有字体
+    emojiConfig.GlyphMinAdvanceX = 13.0f;  // 使用合并模式时，建议设置此值
+    emojiConfig.PixelSnapH = true;  // 像素对齐
+    emojiConfig.GlyphOffset.y = 0.0f;  // 垂直偏移（调整为0，避免偏移问题）
+    emojiConfig.OversampleH = 1;  // 降低过采样，避免atlas过大
+    emojiConfig.OversampleV = 1;  // 降低过采样，避免atlas过大
+    emojiConfig.RasterizerMultiply = 1.0f;  // 字体渲染倍数
+    
+    // Emoji Unicode范围（精简范围，只包含常用的emoji）
+    // 注意：范围太大可能导致字体atlas过大，影响性能
+    static const ImWchar emoji_ranges[] = {
+        0x2600, 0x26FF,    // 杂项符号
+        0x2700, 0x27BF,    // 装饰符号
+        0x1F300, 0x1F9FF,  // 各种符号和象形文字（主要emoji范围，包含🎮🚀等）
+        0x1F600, 0x1F64F,  // 表情符号
+        0x1F680, 0x1F6FF,  // 交通和地图符号
+        0x1F1E0, 0x1F1FF,  // 旗帜
+        0
+    };
+    
+    // 尝试加载emoji字体，使用更宽松的配置
+    bool emojiLoaded = false;
+    
+    // 方法1: 尝试直接加载emoji字体文件
+    // 重要：MergeMode要求主字体已经加载并设置为默认字体
+    for (int i = 0; emojiFontPaths[i] != nullptr; i++) {
+        FILE* testFile = nullptr;
+        if (fopen_s(&testFile, emojiFontPaths[i], "rb") == 0 && testFile != nullptr) {
+            fclose(testFile);
+            // 尝试加载，使用更大的字体大小（emoji通常需要更大的尺寸才能清晰显示）
+            ImFont* emojiFont = io.Fonts->AddFontFromFileTTF(emojiFontPaths[i], 24.0f, &emojiConfig, emoji_ranges);
+            if (emojiFont != nullptr) {
+                std::cout << "成功加载emoji字体: " << emojiFontPaths[i] << " (24px)" << std::endl;
+                emojiLoaded = true;
+                // 继续尝试加载其他字体以支持更多emoji范围
+            } else {
+                // 如果24px失败，尝试18px
+                emojiFont = io.Fonts->AddFontFromFileTTF(emojiFontPaths[i], 18.0f, &emojiConfig, emoji_ranges);
+                if (emojiFont != nullptr) {
+                    std::cout << "成功加载emoji字体: " << emojiFontPaths[i] << " (18px)" << std::endl;
+                    emojiLoaded = true;
+                } else {
+                    std::cout << "尝试加载emoji字体失败: " << emojiFontPaths[i] << std::endl;
+                }
+            }
+        } else {
+            std::cout << "字体文件不存在: " << emojiFontPaths[i] << std::endl;
+        }
+    }
+    
+    // 方法2: 如果直接加载失败，尝试使用Segoe UI（可能包含部分emoji支持）
+    if (!emojiLoaded) {
+        const char* fallbackFonts[] = {
+            "C:/Windows/Fonts/segoeui.ttf",
+            "C:/Windows/Fonts/segoeuib.ttf",
+            "C:/Windows/Fonts/calibri.ttf",
+            nullptr
+        };
+        for (int i = 0; fallbackFonts[i] != nullptr; i++) {
+            FILE* testFile = nullptr;
+            if (fopen_s(&testFile, fallbackFonts[i], "rb") == 0 && testFile != nullptr) {
+                fclose(testFile);
+                ImFont* fallbackFont = io.Fonts->AddFontFromFileTTF(fallbackFonts[i], 20.0f, &emojiConfig, emoji_ranges);
+                if (fallbackFont != nullptr) {
+                    std::cout << "使用备用字体: " << fallbackFonts[i] << std::endl;
+                    emojiLoaded = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    // 方法3: 如果还是失败，尝试不指定字符范围，让字体自己决定
+    if (!emojiLoaded) {
+        for (int i = 0; emojiFontPaths[i] != nullptr; i++) {
+            FILE* testFile = nullptr;
+            if (fopen_s(&testFile, emojiFontPaths[i], "rb") == 0 && testFile != nullptr) {
+                fclose(testFile);
+                // 不指定字符范围，加载所有字符
+                ImFont* emojiFont = io.Fonts->AddFontFromFileTTF(emojiFontPaths[i], 20.0f, &emojiConfig, nullptr);
+                if (emojiFont != nullptr) {
+                    std::cout << "成功加载emoji字体(全字符): " << emojiFontPaths[i] << std::endl;
+                    emojiLoaded = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    // 方法4: 尝试使用Windows字体目录中的所有Segoe字体
+    if (!emojiLoaded) {
+        const char* allSegoeFonts[] = {
+            "C:/Windows/Fonts/SegoeIcons.ttf",
+            "C:/Windows/Fonts/segoeui.ttf",
+            "C:/Windows/Fonts/segoeuib.ttf",
+            "C:/Windows/Fonts/segoeuii.ttf",
+            "C:/Windows/Fonts/segoeuil.ttf",
+            "C:/Windows/Fonts/segoeuisl.ttf",
+            "C:/Windows/Fonts/segoeuiz.ttf",
+            nullptr
+        };
+        for (int i = 0; allSegoeFonts[i] != nullptr; i++) {
+            FILE* testFile = nullptr;
+            if (fopen_s(&testFile, allSegoeFonts[i], "rb") == 0 && testFile != nullptr) {
+                fclose(testFile);
+                ImFont* segoeFont = io.Fonts->AddFontFromFileTTF(allSegoeFonts[i], 20.0f, &emojiConfig, emoji_ranges);
+                if (segoeFont != nullptr) {
+                    std::cout << "成功加载Segoe字体: " << allSegoeFonts[i] << std::endl;
+                    emojiLoaded = true;
+                    break;
+                }
+            }
+        }
+    }
+    
+    if (!emojiLoaded) {
+        std::cout << "警告: 未找到专门的emoji字体文件" << std::endl;
+        std::cout << "emoji字符（如🎮）可能显示为问号或乱码" << std::endl;
+        std::cout << "Windows系统通常通过字体回退机制显示emoji，但ImGui需要显式加载字体" << std::endl;
+        std::cout << "建议: 可以下载并安装 Noto Color Emoji 或其他emoji字体" << std::endl;
+    } else {
+        std::cout << "emoji字体加载成功，emoji字符应该可以正常显示" << std::endl;
+    }
+    
+    // 注意：新版本的 ImGui 后端会自动构建字体纹理，不需要手动调用 Build() 或 GetTexDataAsRGBA32()
+    // 字体会在第一次渲染时自动构建（在渲染器初始化之后）
+    // 验证字体是否正确加载
+    if (font != nullptr) {
+        std::cout << "主字体已加载: 是" << std::endl;
+        // 字体大小在加载时已指定（18px 或 16px）
+    }
 
     // 设置美化颜色主题
     ImGui::StyleColorsDark();
@@ -237,31 +404,34 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
         ImGui::NextColumn();
         
         // CPU同步到GPU等待时长 - 圆形显示
-        //if (showWaitTime) 
-        //{
-            // 将等待时长转换为百分比显示（0-10ms对应0-100%）
-            float maxWaitTime = 10.0f; // 最大参考值10ms
-            float waitPercent = (gpu.dataTransferWaitTime / maxWaitTime) * 100.0f;
-            waitPercent = std::min(100.0f, waitPercent);
-            
-            // 根据等待时长选择颜色（反向：等待时间越短越好）
-            ImVec4 waitColor;
-            if (gpu.dataTransferWaitTime > 5.0f) {
-                waitColor = ImVec4(1.0f, 0.3f, 0.3f, 1.0f); // 红色 - 警告
-            } else if (gpu.dataTransferWaitTime > 2.0f) {
-                waitColor = ImVec4(1.0f, 0.7f, 0.3f, 1.0f); // 橙色 - 注意
-            } else {
-                waitColor = ImVec4(0.3f, 1.0f, 0.3f, 1.0f); // 绿色 - 正常
-            }
-            
-            DrawCircularProgress("CPU同步到GPU等待时长", waitPercent, 0.0f, 100.0f,
-                               ImVec2(circleSize, circleSize),
-                               waitColor, "%");
-            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "实际: %.2f ms", gpu.dataTransferWaitTime);
-        //} else {
-            // 如果没有等待时长数据，显示占位或隐藏
-        //    ImGui::Text("");
-        //}
+        // 将等待时长转换为百分比显示（反向：等待时间越短越好）
+        // 0ms = 0%（最佳），10ms = 100%（最差）
+        float maxWaitTime = 10.0f; // 最大参考值10ms
+        float waitTime = std::max(0.0f, gpu.dataTransferWaitTime); // 确保非负
+        float waitPercent = (waitTime / maxWaitTime) * 100.0f;
+        waitPercent = std::min(100.0f, waitPercent);
+        
+        // 根据等待时长选择颜色（反向：等待时间越短越好）
+        ImVec4 waitColor;
+        if (waitTime > 5.0f) {
+            waitColor = ImVec4(1.0f, 0.3f, 0.3f, 1.0f); // 红色 - 警告
+        } else if (waitTime > 2.0f) {
+            waitColor = ImVec4(1.0f, 0.7f, 0.3f, 1.0f); // 橙色 - 注意
+        } else {
+            waitColor = ImVec4(0.3f, 1.0f, 0.3f, 1.0f); // 绿色 - 正常
+        }
+        
+        // 显示圆形进度条（百分比越高表示等待时间越长，越差）
+        DrawCircularProgress("CPU同步到GPU等待时长", waitPercent, 0.0f, 100.0f,
+                           ImVec2(circleSize, circleSize),
+                           waitColor, "%");
+        
+        // 显示实际等待时间
+        if (waitTime < 0.01f) {
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "实际: < 0.01 ms (正常)");
+        } else {
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "实际: %.2f ms", waitTime);
+        }
         ImGui::NextColumn();
         
         ImGui::Columns(1);
@@ -369,29 +539,66 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
                     }
                 }
                 
-                // 电压行
+                // 功率行（显示功率信息，单位：W）
                 ImGui::TableNextRow();
                 ImGui::TableNextColumn();
-                ImGui::Text("电压");
+                ImGui::Text("功率");
                 ImGui::TableNextColumn();
-                if (gpu.currentVoltage > 0.0f && gpu.maxVoltage > 0.0f) {
-                    // 显示：最大电压 | 实时电压 | 百分比
-                    ImGui::Text("最大: %.0f mV | 实时: %.0f mV", gpu.maxVoltage, gpu.currentVoltage);
+                if (gpu.powerUsage > 0) {
+                    // 获取最大功耗限制
+                    unsigned int maxPowerLimit = 0;
+                    nvmlDevice_t device;
+                    if (nvmlDeviceGetHandleByIndex(0, &device) == NVML_SUCCESS) {
+                        unsigned int minPowerLimit = 0;
+                        if (nvmlDeviceGetPowerManagementLimitConstraints(device, &minPowerLimit, &maxPowerLimit) != NVML_SUCCESS) {
+                            maxPowerLimit = 0;
+                        }
+                    }
+                    
+                    float powerPercent = 0.0f;
+                    if (maxPowerLimit > 0) {
+                        float maxPowerW = static_cast<float>(maxPowerLimit) / 1000.0f; // 转换为瓦特
+                        powerPercent = (static_cast<float>(gpu.powerUsage) / maxPowerW) * 100.0f;
+                        powerPercent = std::min(100.0f, std::max(0.0f, powerPercent));
+                        // 显示：最大功率 | 实时功率 | 百分比（单位：W）
+                        ImGui::Text("最大: %.0f W | 实时: %u W", maxPowerW, gpu.powerUsage);
+                    } else {
+                        // 如果没有最大功耗限制，只显示实时功率
+                        ImGui::Text("实时: %u W", gpu.powerUsage);
+                    }
                     ImGui::SameLine();
-                    ImVec4 voltageColor = GetStatusColor(gpu.voltagePercent, 0.0f, 90.0f, true);
-                    ImGui::TextColored(voltageColor, "(%.1f%%)", gpu.voltagePercent);
+                    if (powerPercent > 0.0f) {
+                        ImVec4 powerColor = GetStatusColor(powerPercent, 0.0f, 90.0f, true);
+                        ImGui::TextColored(powerColor, "(%.1f%%)", powerPercent);
+                    }
                 } else {
                     ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "不可用");
                 }
                 ImGui::TableNextColumn();
-                if (gpu.voltagePercent > 0.0f) {
-                    ImVec4 voltageColor = GetStatusColor(gpu.voltagePercent, 0.0f, 90.0f, true);
-                    ImGui::TextColored(voltageColor, "%.1f%%", gpu.voltagePercent);
+                if (gpu.powerUsage > 0) {
+                    // 计算功率百分比
+                    unsigned int maxPowerLimit = 0;
+                    nvmlDevice_t device;
+                    float powerPercent = 0.0f;
+                    if (nvmlDeviceGetHandleByIndex(0, &device) == NVML_SUCCESS) {
+                        unsigned int minPowerLimit = 0;
+                        if (nvmlDeviceGetPowerManagementLimitConstraints(device, &minPowerLimit, &maxPowerLimit) == NVML_SUCCESS && maxPowerLimit > 0) {
+                            float maxPowerW = static_cast<float>(maxPowerLimit) / 1000.0f;
+                            powerPercent = (static_cast<float>(gpu.powerUsage) / maxPowerW) * 100.0f;
+                            powerPercent = std::min(100.0f, std::max(0.0f, powerPercent));
+                        }
+                    }
+                    if (powerPercent > 0.0f) {
+                        ImVec4 powerColor = GetStatusColor(powerPercent, 0.0f, 90.0f, true);
+                        ImGui::TextColored(powerColor, "%.1f%%", powerPercent);
+                    } else {
+                        ImGui::Text("-");
+                    }
                 } else {
                     ImGui::Text("-");
                 }
                 ImGui::TableNextColumn();
-                // 电压历史图表（如果有历史数据的话，可以添加）
+                // 功率历史图表（如果有历史数据的话，可以添加）
                 ImGui::Text("-");
                 
                 ImGui::EndTable();

@@ -32,8 +32,8 @@ struct GPUInfo {
     float videoEngineLoad = 0.0f;     // 视频引擎负载 (%) - 如果可用
     
     // 电压信息
-    float currentVoltage = 0.0f;      // 实时电压 (mV)
-    float maxVoltage = 0.0f;          // 最大电压 (mV)
+    float currentVoltage = 0.0f;      // 实时电压 (V)
+    float maxVoltage = 0.0f;          // 最大电压 (V)
     float voltagePercent = 0.0f;      // 电压百分比 (%)
     
     // PCIe 带宽信息
