@@ -438,7 +438,7 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
         ImGui::Spacing();
     }
 
-    // 详细信息 - 使用表格布局压缩显示
+    // 详细信息 - 使用表格布局，美观大气
     if (gpuCount > 0 && gpu.available) {
         // GPU详细信息 - 紧凑表格
         ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.15f, 0.5f));
@@ -603,6 +603,49 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
                 
                 ImGui::EndTable();
             }
+            
+            // 在表格下方添加历史图表，填充空间
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            
+            // GPU利用率历史图表
+            if (!gpu.utilizationHistory.empty()) {
+                DrawHistoryChart("GPU利用率历史", gpu.utilizationHistory, 0.0f, 100.0f, "%");
+                ImGui::Spacing();
+            }
+            
+            // 显存使用历史图表
+            if (!gpu.memoryHistory.empty()) {
+                DrawHistoryChart("显存使用历史", gpu.memoryHistory, 0.0f, 100.0f, "%");
+                ImGui::Spacing();
+            }
+            
+            // PCIe 吞吐量历史图表
+            if (!gpu.pcieRxHistory.empty() || !gpu.pcieTxHistory.empty()) {
+                // 合并显示接收和发送
+                std::vector<float> combinedThroughput;
+                size_t maxSize = std::max(gpu.pcieRxHistory.size(), gpu.pcieTxHistory.size());
+                combinedThroughput.reserve(maxSize);
+                for (size_t i = 0; i < maxSize; i++) {
+                    float rx = (i < gpu.pcieRxHistory.size()) ? gpu.pcieRxHistory[i] : 0.0f;
+                    float tx = (i < gpu.pcieTxHistory.size()) ? gpu.pcieTxHistory[i] : 0.0f;
+                    combinedThroughput.push_back(rx + tx);
+                }
+                if (!combinedThroughput.empty()) {
+                    float maxThroughput = *std::max_element(combinedThroughput.begin(), combinedThroughput.end());
+                    DrawHistoryChart("PCIe吞吐量历史", combinedThroughput, 0.0f, 
+                                   maxThroughput > 0 ? maxThroughput * 1.2f : 1000.0f, "MB/s");
+                    ImGui::Spacing();
+                }
+            }
+            
+            // 温度历史图表
+            if (!gpu.temperatureHistory.empty()) {
+                float maxTemp = *std::max_element(gpu.temperatureHistory.begin(), gpu.temperatureHistory.end());
+                DrawHistoryChart("GPU温度历史", gpu.temperatureHistory, 0.0f, 
+                               maxTemp > 0 ? maxTemp * 1.2f : 100.0f, "°C");
+            }
         }
         ImGui::EndChild();
         ImGui::PopStyleVar();
@@ -647,7 +690,6 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
-    
     ImGui::NextColumn();
     
     // 内存详细信息
