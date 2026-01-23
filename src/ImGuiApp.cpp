@@ -21,7 +21,7 @@
 #endif
 
 ImGuiApp::ImGuiApp(const std::string& title, int width, int height)
-    : title_(title), width_(width), height_(height) {
+    : title_(title), width_(width), height_(height), isMaximized_(false) {
 }
 
 ImGuiApp::~ImGuiApp() {
@@ -39,6 +39,8 @@ bool ImGuiApp::Initialize() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+    // 使用无边框窗口，去掉系统默认的浅色标题栏，让整体风格完全由 ImGui 控制
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 
     // 创建窗口
     window_ = glfwCreateWindow(width_, height_, title_.c_str(), nullptr, nullptr);
@@ -312,7 +314,8 @@ void ImGuiApp::EndFrame() {
     glfwGetFramebufferSize(window_, &display_w, &display_h);
     glViewport(0, 0, display_w, display_h);
     
-    glClearColor(0.1f, 0.1f, 0.1f, 1.0f);
+    // 使用与 WindowBg 相同的颜色，避免窗口边缘出现不同颜色的“透明边框”感
+    glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT);
     
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
@@ -329,20 +332,74 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize, ImGuiCond_Always);
     
     // 使用 ## 创建隐藏的唯一ID，避免空ID错误
+    // 主窗口本身不滚动，只作为固定外框和标题栏
     ImGui::Begin("DeepInsight Blackwell - 硬件资源监控##MainWindow", nullptr, 
                  ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | 
-                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse);
+                 ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
+                 ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
-    // 紧凑标题栏
+    // 自定义标题栏（包含窗口控制按钮）
+    float windowWidth = ImGui::GetWindowWidth();
+    
+    // 创建可拖动的标题栏区域（在显示内容之前）
+    ImGui::InvisibleButton("##TitleBarDrag", ImVec2(windowWidth - 120, 30));
+    
+    // 实现窗口拖动
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+        ImVec2 delta = ImGui::GetMouseDragDelta(ImGuiMouseButton_Left);
+        int x, y;
+        glfwGetWindowPos(window_, &x, &y);
+        glfwSetWindowPos(window_, x + (int)delta.x, y + (int)delta.y);
+        ImGui::ResetMouseDragDelta(ImGuiMouseButton_Left);
+    }
+    
+    // 标题文字
+    ImGui::SetCursorPosY(ImGui::GetCursorPosY() - 30);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.4f, 0.8f, 1.0f, 1.0f));
     ImGui::SetWindowFontScale(1.1f);
     ImGui::Text("🚀 DeepInsight Blackwell");
     ImGui::SetWindowFontScale(1.0f);
     ImGui::PopStyleColor();
-    ImGui::SameLine(ImGui::GetWindowWidth() - 150);
+    
+    // 右侧：实时监控文字和窗口控制按钮
+    ImGui::SameLine(windowWidth - 200);
     ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "实时监控");
+    
+    // 窗口控制按钮（最小化、最大化/还原、关闭）
+    ImGui::SameLine(windowWidth - 120);
+    
+    // 最小化按钮
+    if (ImGui::Button("─", ImVec2(30, 20))) {
+        glfwIconifyWindow(window_);
+    }
+    ImGui::SameLine();
+    
+    // 最大化/还原按钮（每帧检查窗口状态）
+    isMaximized_ = (glfwGetWindowAttrib(window_, GLFW_MAXIMIZED) == GLFW_TRUE);
+    const char* maximizeText = isMaximized_ ? "❐" : "□";
+    if (ImGui::Button(maximizeText, ImVec2(30, 20))) {
+        if (isMaximized_) {
+            glfwRestoreWindow(window_);
+        } else {
+            glfwMaximizeWindow(window_);
+        }
+    }
+    ImGui::SameLine();
+    
+    // 关闭按钮（红色）
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.9f, 0.1f, 0.1f, 1.0f));
+    if (ImGui::Button("✕", ImVec2(30, 20))) {
+        glfwSetWindowShouldClose(window_, GLFW_TRUE);
+    }
+    ImGui::PopStyleColor(3);
+    
     ImGui::Separator();
     ImGui::Spacing();
+
+    // 下面的内容都放在一个子窗口里滚动，保证上方标题栏和边框始终固定
+    ImGui::BeginChild("MainContent", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
 
     // 获取数据
     size_t gpuCount = monitor.GetGPUCount();
@@ -352,55 +409,69 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
     const SystemBandwidthInfo& bandwidth = monitor.GetSystemBandwidthInfo();
     
     // 计算自适应网格大小（根据窗口宽度）
-    float windowWidth = ImGui::GetWindowWidth();
+    // windowWidth 已在标题栏部分定义，这里直接使用
     bool showWaitTime = (gpuCount > 0 && gpu.available && gpu.dataTransferWaitTime > 0.0f);
     
-    // 计算圆形大小（自适应窗口宽度，第一行3个，第二行2个）
-    float circleSize = (windowWidth / 3.0f) * 0.5f; // 基于3列计算，让圆形更紧凑
-    circleSize = std::max(100.0f, std::min(180.0f, circleSize)); // 限制在100-180之间
+    // 计算圆形大小（自适应窗口宽度，5个图标一排）
+    float circleSize = (windowWidth / 5.0f) * 0.6f; // 基于5列计算
+    circleSize = std::max(80.0f, std::min(150.0f, circleSize)); // 限制在80-150之间
 
-    // 顶部圆形指标 - 两行布局：第一行2个，第二行3个
+    // 顶部圆形指标 - 一行布局：5个圆形
     if (gpuCount > 0 && gpu.available) {
-        // 第一行：2个圆形（居中显示）
-        ImGui::Columns(4, "TopMetricsRow1", false);
-        ImGui::SetColumnWidth(0, windowWidth / 4.0f); // 左边留空，用于居中
-        ImGui::SetColumnWidth(1, windowWidth / 4.0f); // 中间列，放置第一个圆形
-        ImGui::SetColumnWidth(2, windowWidth / 4.0f); // 中间列，放置第二个圆形
-        ImGui::SetColumnWidth(3, windowWidth / 4.0f); // 右边留空，用于居中
-        
-        ImGui::NextColumn(); // 跳过第一列（留空）
+        // 一行：5个圆形
+        ImGui::Columns(5, "TopMetricsRow", false);
+        for (int i = 0; i < 5; i++) {
+            ImGui::SetColumnWidth(i, windowWidth / 5.0f);
+        }
         
         // GPU利用率 - 圆形显示（标明数据类型）
         DrawCircularProgress("GPU利用率", gpu.utilization, 0.0f, 100.0f, 
                            ImVec2(circleSize, circleSize),
                            GetStatusColor(gpu.utilization, 85.0f, 100.0f), "%");
+        // 显示实际GPU利用率（居中）
+        char gpuText[32];
+        snprintf(gpuText, sizeof(gpuText), "实际: %.1f%%", gpu.utilization);
+        float gpuTextWidth = ImGui::CalcTextSize(gpuText).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (windowWidth / 5.0f - gpuTextWidth) * 0.5f);
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", gpuText);
         ImGui::NextColumn();
         
         // 显存占用 - 圆形显示（标明数据类型）
         DrawCircularProgress("显存占用", gpu.memoryPercent, 0.0f, 100.0f,
                            ImVec2(circleSize, circleSize),
                            GetStatusColor(gpu.memoryPercent, 80.0f, 95.0f, true), "%");
+        // 显示实际显存使用量（居中）
+        float vramUsedGB = gpu.memoryUsed / 1024.0f;
+        float vramTotalGB = gpu.memoryTotal / 1024.0f;
+        char vramText[32];
+        snprintf(vramText, sizeof(vramText), "实际: %.2f GB", vramUsedGB);
+        float vramTextWidth = ImGui::CalcTextSize(vramText).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (windowWidth / 5.0f - vramTextWidth) * 0.5f);
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", vramText);
         ImGui::NextColumn();
-        
-        ImGui::Columns(1);
-        ImGui::Spacing();
-        
-        // 第二行：3个圆形
-        ImGui::Columns(3, "TopMetricsRow2", false);
-        for (int i = 0; i < 3; i++) {
-            ImGui::SetColumnWidth(i, windowWidth / 3.0f);
-        }
         
         // CPU利用率 - 圆形显示（标明数据类型）
         DrawCircularProgress("CPU利用率", cpu.utilization, 0.0f, 100.0f,
                            ImVec2(circleSize, circleSize),
                            GetStatusColor(cpu.utilization, 30.0f, 70.0f), "%");
+        // 显示实际CPU利用率（居中）
+        char cpuText[32];
+        snprintf(cpuText, sizeof(cpuText), "实际: %.1f%%", cpu.utilization);
+        float cpuTextWidth = ImGui::CalcTextSize(cpuText).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (windowWidth / 5.0f - cpuTextWidth) * 0.5f);
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", cpuText);
         ImGui::NextColumn();
         
         // 内存使用 - 圆形显示（标明数据类型）
         DrawCircularProgress("内存使用", mem.percent, 0.0f, 100.0f,
                            ImVec2(circleSize, circleSize),
                            GetStatusColor(mem.percent, 0.0f, 80.0f, true), "%");
+        // 显示实际内存使用量（居中）
+        char memText[32];
+        snprintf(memText, sizeof(memText), "实际: %.2f GB", mem.used);
+        float memTextWidth = ImGui::CalcTextSize(memText).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (windowWidth / 5.0f - memTextWidth) * 0.5f);
+        ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", memText);
         ImGui::NextColumn();
         
         // CPU同步到GPU等待时长 - 圆形显示
@@ -426,11 +497,19 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
                            ImVec2(circleSize, circleSize),
                            waitColor, "%");
         
-        // 显示实际等待时间
+        // 显示实际等待时间（居中）
+        char waitText[32];
         if (waitTime < 0.01f) {
-            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "实际: < 0.01 ms (正常)");
+            snprintf(waitText, sizeof(waitText), "实际: < 0.01 ms");
         } else {
-            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "实际: %.2f ms", waitTime);
+            snprintf(waitText, sizeof(waitText), "实际: %.2f ms", waitTime);
+        }
+        float waitTextWidth = ImGui::CalcTextSize(waitText).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (windowWidth / 5.0f - waitTextWidth) * 0.5f);
+        if (waitTime < 0.01f) {
+            ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "%s", waitText);
+        } else {
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "%s", waitText);
         }
         ImGui::NextColumn();
         
@@ -438,17 +517,8 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
         ImGui::Spacing();
     }
 
-    // 主机带宽模块 - 使用圆形图表显示（放在GPU详细信息之前）
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.12f, 0.15f, 0.5f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 12.0f));
-    // 使用 0 作为高度，让子窗口根据内容自动调整，没有数据时自动压缩
-    if (ImGui::BeginChild("Bandwidth", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar)) {
-        RenderSystemBandwidthInfo(bandwidth, monitor);
-    }
-    ImGui::EndChild();
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor();
+    // 主机带宽模块 - 直接渲染内容，不使用子窗口避免占满剩余高度
+    RenderSystemBandwidthInfo(bandwidth, monitor);
     ImGui::Spacing();
 
     // 详细信息 - 使用表格布局，美观大气
@@ -867,7 +937,11 @@ void ImGuiApp::RenderMainWindow(const HardwareMonitor& monitor) {
     ImGui::EndChild();
     ImGui::PopStyleVar();
     ImGui::PopStyleColor();
+    
+    // 结束滚动内容区域
+    ImGui::EndChild();
 
+    // 结束主窗口
     ImGui::End();
 }
 
@@ -1049,7 +1123,7 @@ void ImGuiApp::RenderMemoryInfo(const MemoryInfo& memory) {
 }
 
 void ImGuiApp::RenderSystemBandwidthInfo(const SystemBandwidthInfo& bandwidth, const HardwareMonitor& monitor) {
-    ImGui::TextColored(ImVec4(0.8f, 0.4f, 1.0f, 1.0f), "🌐 主机带宽模块");
+    ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "🌐 主机带宽模块");
     ImGui::Separator();
     
     // 总系统带宽（主板总带宽）

@@ -48,5 +48,6 @@ private:
     int width_;
     int height_;
     GLFWwindow* window_ = nullptr;
+    bool isMaximized_ = false;
 };
 
